@@ -11,16 +11,6 @@ if android_world_parent not in sys.path:
     sys.path.insert(0, android_world_parent)
 
 from android_world.env import env_launcher
-# Type definition for answer from AndroidWorldDataset
-# answer 是一个字典，包含以下字段：
-# {
-#     "task_name": str,           # 任务名称
-#     "params": dict,              # 任务参数
-#     "instance_seed": int,        # 实例种子
-#     "class_name": str,           # 任务类名
-#     "task": TaskEval             # AndroidWorld 任务实例对象
-# }
-AndroidAnswer = dict[str, Any]
 
 
 class AndroidReward:
@@ -47,8 +37,6 @@ class AndroidReward:
                 device_id = self.device_id,
             )
         return self._env
-
-    def get_reward(self, env,  result: StepResult, answer: AndroidAnswer):
         print(f"task name and params: {answer['task_name']}, {answer['params']}")
         if not result.finished:
             return 0.0
