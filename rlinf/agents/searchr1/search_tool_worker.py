@@ -68,7 +68,6 @@ class SearchToolWorker(ToolWorker):
         super().__init__()
         self.cfg = cfg
         self.topk = self.cfg.tools.search.topk
-        self.dummy_mode = self.cfg.tools.search.get("dummy_mode", False)
         self.request_processor_task = None
         self.search_client = AsyncSearchClient(cfg=self.cfg)
 
@@ -120,12 +119,8 @@ class SearchToolWorker(ToolWorker):
                     "topk": self.topk,
                     "return_scores": False,
                 }
-                full_text = (
-                    "<information>\nNo search results are found.\n</information>"
-                )
-                if not self.dummy_mode:
-                    response = await self.search_client.query_async(req_meta)
-                    full_text = process_tool_result(response)
+                response = await self.search_client.query_async(req_meta)
+                full_text = process_tool_result(response)
 
                 result = ToolChannelResponse(
                     success=True,

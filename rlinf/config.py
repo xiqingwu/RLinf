@@ -26,7 +26,6 @@ import yaml
 from omegaconf import OmegaConf, open_dict
 from omegaconf.dictconfig import DictConfig
 
-from rlinf.envs import SupportedEnvType
 from rlinf.scheduler.cluster import Cluster
 from rlinf.utils.placement import (
     HybridComponentPlacement,
@@ -46,6 +45,7 @@ class SupportedModel(Enum):
     QWEN2_5 = ("qwen2.5", "reasoning")
     QWEN2_5_VL = ("qwen2.5_vl", "reasoning")
     QWEN3 = ("qwen3", "reasoning")
+    QWEN3_VL = ("qwen3_vl", "reasoning")
     QWEN3_MOE = ("qwen3_moe", "reasoning")
 
     # Embodied models
@@ -54,15 +54,7 @@ class SupportedModel(Enum):
     OPENPI = ("openpi", "embodied")
     MLP_POLICY = ("mlp_policy", "embodied")
     GR00T = ("gr00t", "embodied")
-    DEXBOTIC_PI = ("dexbotic_pi", "embodied")
     CNN_POLICY = ("cnn_policy", "embodied")
-    FLOW_POLICY = ("flow_policy", "embodied")
-    CMA_POLICY = ("cma", "embodied")
-
-    # Sft models
-    QWEN2_5_VL_SFT = ("qwen2.5_vl", "sft")
-    QWEN3_VL_SFT = ("qwen3_vl", "sft")
-    QWEN3_VL_MOE_SFT = ("qwen3_vl_moe", "sft")
 
     def __new__(cls, value, category):
         obj = object.__new__(cls)
@@ -93,16 +85,14 @@ SUPPORTED_TRAINING_BACKENDS = ["megatron", "fsdp"]
 __all__ = ["build_config"]
 
 
-def torch_dtype_from_precision(
-    precision: Union[int, str, None],
-) -> Optional[torch.dtype]:
+def torch_dtype_from_precision(precision: Union[int, str]) -> torch.dtype:
     if precision in ["bf16", "bf16-mixed"]:
         return torch.bfloat16
     elif precision in [16, "16", "fp16", "16-mixed"]:
         return torch.float16
     elif precision in [32, "32", "fp32", "32-true"]:
         return torch.float32
-    elif precision in [None, "null"]:
+    elif precision in [None]:
         return None
     else:
         raise ValueError(
@@ -310,47 +300,16 @@ def validate_model_cfg_by_hf_config(cfg, hf_model_path):
     return cfg
 
 
-def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
+def validate_fsdp_cfg(cfg: DictConfig, resume_dir: Optional[str] = None) -> DictConfig:
     def validate_amp_cfg(config: DictConfig) -> DictConfig:
-        """Validate AMP configuration and ensure mutual exclusivity with FSDP mixed_precision."""
-
-        param_dtype = config.mixed_precision.param_dtype
-        reduce_dtype = config.mixed_precision.reduce_dtype
-        buffer_dtype = config.mixed_precision.buffer_dtype
-
-        all_none = param_dtype is None and reduce_dtype is None and buffer_dtype is None
-
-        all_fp32 = (
-            param_dtype == "fp32" and reduce_dtype == "fp32" and buffer_dtype == "fp32"
+        if "amp" not in config:
+            config.amp = {}
+        config.amp.enabled = config.amp.get("enabled", False)
+        config.amp.precision = config.amp.get("precision", "bf16")
+        assert config.amp.precision in ["fp16", "bf16", "fp32"], (
+            "fsdp.amp.precision must be one of ['fp16', 'bf16', 'fp32']"
         )
-
-        use_fsdp_mixed_precision = not (all_none or all_fp32)
-
-        amp_autocast = config.get("amp_autocast", {})
-        config.amp_autocast = {
-            "enabled": amp_autocast.get("enabled", False),
-            "precision": amp_autocast.get("precision", "bf16"),
-        }
-
-        grad_scaler = config.get("grad_scaler", {})
-        config.grad_scaler = {
-            "enabled": grad_scaler.get("enabled", False),
-            "init_scale": grad_scaler.get("init_scale", None),
-            "growth_interval": grad_scaler.get("growth_interval", None),
-        }
-
-        if "amp" in config:
-            logging.warning(
-                "fsdp_config.amp is no longer supported, use fsdp_config.amp_autocast and fsdp_config.grad_scaler instead"
-            )
-
-        if config.amp_autocast.enabled and use_fsdp_mixed_precision:
-            assert False, (
-                "amp_autocast should not be enabled when fsdp mixed_precision is enabled"
-            )
-        assert config.amp_autocast.precision in ["fp16", "bf16", "fp32"], (
-            "fsdp.amp_autocast.precision must be one of ['fp16', 'bf16', 'fp32']"
-        )
+        config.amp.use_grad_scaler = config.amp.get("use_grad_scaler", False)
         return config
 
     OmegaConf.set_struct(cfg, True)
@@ -374,6 +333,7 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
         cfg.fsdp_config.use_liger_kernel = cfg.fsdp_config.get(
             "use_liger_kernel", False
         )
+        cfg.fsdp_config = validate_amp_cfg(cfg.fsdp_config)
 
         cfg.fsdp_config.cpu_offload = cfg.fsdp_config.get("cpu_offload", False)
         cfg.fsdp_config.offload_pin_memory = cfg.fsdp_config.get(
@@ -386,6 +346,9 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
             "enable_gradient_accumulation", False
         )
 
+        if resume_dir is not None:
+            cfg.fsdp_config.use_orig_params = True
+
         assert cfg.fsdp_config.backward_prefetch in [
             None,
             "pre",
@@ -396,17 +359,17 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
         assert hasattr(cfg.fsdp_config, "mixed_precision"), (
             "fsdp_config.mixed_precision is required in FSDP actor configuration."
         )
+
         mixed_precision_config = cfg.fsdp_config.mixed_precision
         mixed_precision_config.param_dtype = mixed_precision_config.get(
-            "param_dtype", None
+            "param_dtype", "bf16"
         )
         mixed_precision_config.reduce_dtype = mixed_precision_config.get(
-            "reduce_dtype", None
+            "reduce_dtype", "bf16"
         )
         mixed_precision_config.buffer_dtype = mixed_precision_config.get(
-            "buffer_dtype", None
+            "buffer_dtype", "fp32"
         )
-        cfg.fsdp_config = validate_amp_cfg(cfg.fsdp_config)
 
     return cfg
 
@@ -579,12 +542,6 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
             "use_tokenizer_model_from_checkpoint_args", False
         )
 
-        # cfg.model
-        assert (
-            cfg.model.get("precision", None) is not None
-            and torch_dtype_from_precision(cfg.model.precision) is not None
-        ), "model.precision is required"
-
         cfg.model.tensor_model_parallel_size = cfg.model.get(
             "tensor_model_parallel_size", 1
         )
@@ -606,18 +563,6 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
         cfg.model.expert_tensor_parallel_size = cfg.model.get(
             "expert_tensor_parallel_size", None
         )
-
-        from rlinf.hybrid_engines.megatron.megatron_model_manager import HAVE_FUSCO
-
-        if HAVE_FUSCO:
-            assert (
-                cfg.model.moe_token_dispatcher_type == "alltoall"
-                and cfg.model.expert_model_parallel_size > 1
-                and cfg.model.expert_tensor_parallel_size == 1
-                and not cfg.model.variable_seq_lengths
-            ), (
-                f"FUSCO support detected. to enable FUSCO, moe_token_dispatcher_type must be 'alltoall', expert_model_parallel_size must be greater than 1, expert_tensor_parallel_size must be 1, and variable_seq_lengths must be False. get value ({cfg.model.moe_token_dispatcher_type}, {cfg.model.expert_model_parallel_size}, {cfg.model.expert_tensor_parallel_size}, {cfg.model.variable_seq_lengths})"
-            )
 
         cfg.model.moe_grouped_gemm = cfg.model.get("moe_grouped_gemm", None)
         assert cfg.model.moe_grouped_gemm in [None, "te"], (
@@ -659,15 +604,12 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
         cfg.model.variable_seq_lengths = cfg.model.get("variable_seq_lengths", True)
         cfg.model.add_bias_linear = cfg.model.get("add_bias_linear", False)
 
-        # optimizer config
-        if cfg.optim.get("fp16", None) is None:
-            cfg.optim.fp16 = (
-                torch_dtype_from_precision(cfg.model.precision) == torch.float16
-            )
-        if cfg.optim.get("bf16", None) is None:
-            cfg.optim.bf16 = (
-                torch_dtype_from_precision(cfg.model.precision) == torch.bfloat16
-            )
+        cfg.optim.fp16 = (
+            torch_dtype_from_precision(cfg.model.precision) == torch.float16
+        )
+        cfg.optim.bf16 = (
+            torch_dtype_from_precision(cfg.model.precision) == torch.bfloat16
+        )
         cfg.optim.weight_decay = cfg.optim.get("weight_decay", 0.01)
         cfg.optim.overlap_param_gather_with_optimizer_step = cfg.optim.get(
             "overlap_param_gather_with_optimizer_step", False
@@ -751,10 +693,7 @@ def validate_embodied_cfg(cfg):
     # NOTE: Currently we only support actor_critic as PPO algorithm loss, and only support value_head as critic model.
     # This will be updated in the future to support more algorithms and critic models.
     # Check that actor_critic loss requires value_head
-    if (
-        cfg.algorithm.loss_type == "actor_critic"
-        or cfg.algorithm.loss_type == "decoupled_actor_critic"
-    ):
+    if cfg.algorithm.loss_type == "actor_critic":
         add_value_head = cfg.actor.model.get("add_value_head", False)
         assert add_value_head, (
             f"When using PPO algorithm (algorithm.loss_type='actor_critic'), "
@@ -763,7 +702,9 @@ def validate_embodied_cfg(cfg):
         )
 
     # process num-envs
-    component_placement = HybridComponentPlacement(cfg, Cluster())
+    component_placement = HybridComponentPlacement(
+        cfg, Cluster(cluster_cfg=cfg.cluster)
+    )
     stage_num = cfg.rollout.pipeline_stage_num
     env_world_size = component_placement.get_world_size("env")
 
@@ -827,12 +768,9 @@ def validate_embodied_cfg(cfg):
         )
 
     with open_dict(cfg):
-        weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
-        assert weight_sync_interval > 0, "weight_sync_interval must be greater than 0"
-        cfg.runner.weight_sync_interval = weight_sync_interval
         if (
-            SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.MANISKILL
-            or SupportedEnvType(cfg.env.eval.env_type) == SupportedEnvType.MANISKILL
+            cfg.env.train.env_type == "maniskill"
+            or cfg.env.eval.env_type == "maniskill"
         ):
 
             def get_robot_control_mode(robot: str):
@@ -840,14 +778,10 @@ def validate_embodied_cfg(cfg):
                     return "pd_joint_delta_pos"
                 elif robot == "panda-ee-dpos":
                     return "pd_ee_delta_pos"
-                elif robot == "panda-ee-target-dpos":  # for GSEnv
-                    return "pd_ee_target_delta_pose"
                 elif "google_robot_static" in robot:
                     return "arm_pd_ee_delta_pose_align_interpolate_by_planner_gripper_pd_joint_target_delta_pos_interpolate_by_planner"
                 elif "widowx" in robot:
                     return "arm_pd_ee_target_delta_pose_align2_gripper_pd_joint_pos"
-                elif "panda" in robot:
-                    return "pd_ee_body_target_delta_pose_real_root_frame"
                 else:
                     raise NotImplementedError(f"Robot {robot} not supported")
 
@@ -858,8 +792,7 @@ def validate_embodied_cfg(cfg):
                 cfg.actor.model.policy_setup
             )
         elif (
-            SupportedEnvType(cfg.env.train.env_type) == SupportedEnvType.BEHAVIOR
-            or SupportedEnvType(cfg.env.eval.env_type) == SupportedEnvType.BEHAVIOR
+            cfg.env.train.env_type == "behavior" or cfg.env.eval.env_type == "behavior"
         ):
             import omnigibson as og
 
@@ -874,35 +807,9 @@ def validate_embodied_cfg(cfg):
                 open(config_filename, "r"), Loader=yaml.FullLoader
             )
             omnigibson_cfg = OmegaConf.create(omnigibson_cfg)
-            with open_dict(omnigibson_cfg):
-                omnigibson_cfg.robots[0].obs_modalities = ["rgb", "depth", "proprio"]
             cfg.env.train.omnigibson_cfg = omnigibson_cfg
             cfg.env.eval.omnigibson_cfg = omnigibson_cfg
 
-    return cfg
-
-
-def validate_sft_cfg(cfg: DictConfig) -> DictConfig:
-    assert cfg.actor.get("global_batch_size", None) is not None, (
-        "the actor.global_batch_size is not set"
-    )
-    assert cfg.actor.get("micro_batch_size", None) is not None, (
-        "the actor.micro_batch_size is not set"
-    )
-
-    with open_dict(cfg):
-        if cfg.data.get("train_data_paths", None) is None:
-            # if train_data_paths is None, the code will just eval the model
-            assert cfg.data.get("eval_data_paths", None) is not None, (
-                "the data.train_data_paths is None, so data.eval_data_paths is required"
-            )
-        elif cfg.data.get("eval_data_paths", None) is not None:
-            # set the val_check_interval to max_epochs
-            if cfg.runner.get("val_check_interval", None) is None:
-                cfg.runner.val_check_interval = cfg.runner.max_epochs
-        else:
-            # set the val_check_interval to -1 if there is no eval data
-            cfg.runner.val_check_interval = -1
     return cfg
 
 
@@ -930,13 +837,6 @@ def validate_reasoning_cfg(cfg: DictConfig) -> DictConfig:
         )
         assert cfg.actor.micro_batch_size >= 1
         assert cfg.actor.global_batch_size >= 1
-        if hasattr(cfg, "critic"):
-            cfg.critic.micro_batch_size = cfg.algorithm.training_batch_size_per_gpu
-            cfg.critic.global_batch_size = (
-                cfg.data.rollout_batch_size
-                * cfg.algorithm.group_size
-                // cfg.algorithm.n_minibatches
-            )
         assert cfg.runner.seq_length > cfg.data.max_prompt_length, (
             f"runner.seq_length ({cfg.runner.seq_length}) must be greater than data.max_prompt_length ({cfg.data.max_prompt_length})"
         )
@@ -982,7 +882,7 @@ def validate_coding_online_rl_cfg(cfg: DictConfig) -> DictConfig:
         "Online coding task must use megatron training backend"
     )
 
-    cluster = Cluster()
+    cluster = Cluster(num_nodes=cfg.cluster.num_nodes)
     component_placement = ModelParallelComponentPlacement(cfg, cluster)
     assert component_placement.placement_mode == PlacementMode.DISAGGREGATED, (
         "Online coding task must use disaggregated placement mode"
@@ -1019,17 +919,6 @@ def validate_coding_online_rl_cfg(cfg: DictConfig) -> DictConfig:
 def validate_cfg(cfg: DictConfig) -> DictConfig:
     OmegaConf.set_struct(cfg, True)
 
-    with open_dict(cfg):
-        cfg.runner.per_worker_log = cfg.runner.get("per_worker_log", False)
-        cfg.runner.per_worker_log_path = None
-        if cfg.runner.per_worker_log:
-            cfg.runner.per_worker_log_path = os.path.join(
-                cfg.runner.logger.log_path, "worker_logs"
-            )
-
-    # Init cluster
-    Cluster(cluster_cfg=cfg.cluster, distributed_log_dir=cfg.runner.per_worker_log_path)
-
     assert cfg.runner.task_type in SUPPORTED_TASK_TYPE, (
         f"task_type must be one of {SUPPORTED_TASK_TYPE}"
     )
@@ -1042,10 +931,8 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
     elif cfg.runner.task_type == "reasoning_eval":
         cfg = validate_reasoning_eval_cfg(cfg)
         return cfg
-    elif cfg.runner.task_type == "sft":
-        cfg = validate_sft_cfg(cfg)
 
-    if cfg.algorithm.adv_type in ("grpo", "grpo_dynamic", "reinpp_baseline"):
+    if cfg.algorithm.adv_type in ("grpo", "reinpp_baseline"):
         assert cfg.algorithm.group_size > 1
 
     assert cfg.actor.training_backend in SUPPORTED_TRAINING_BACKENDS, (
@@ -1066,7 +953,9 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
             f"padded_vocab_size ({cfg.actor.model.padded_vocab_size}) must be divisible by tensor_model_parallel_size ({cfg.actor.model.tensor_model_parallel_size})"
         )
     elif cfg.actor.training_backend == "fsdp":
-        component_placement = HybridComponentPlacement(cfg, Cluster())
+        component_placement = HybridComponentPlacement(
+            cfg, Cluster(num_nodes=cfg.cluster.num_nodes)
+        )
         actor_world_size = component_placement.get_world_size("actor")
         assert (
             cfg.actor.global_batch_size
@@ -1075,7 +964,7 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
         ), (
             f"actor.global_batch_size ({cfg.actor.global_batch_size}) must be divisible by (actor.micro_batch_size ({cfg.actor.micro_batch_size}) * actor_world_size ({actor_world_size}))"
         )
-        cfg.actor = validate_fsdp_cfg(cfg.actor)
+        cfg.actor = validate_fsdp_cfg(cfg.actor, cfg.runner.get("resume_dir", None))
 
     if cfg.critic.use_critic_model and cfg.critic.training_backend == "megatron":
         cfg.critic = validate_megatron_cfg(cfg.critic)

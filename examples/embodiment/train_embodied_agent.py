@@ -35,9 +35,7 @@ def main(cfg) -> None:
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
-    cluster = Cluster(
-        cluster_cfg=cfg.cluster, distributed_log_dir=cfg.runner.per_worker_log_path
-    )
+    cluster = Cluster(cluster_cfg=cfg.cluster)
     component_placement = HybridComponentPlacement(cfg, cluster)
 
     # Create actor worker group
@@ -66,11 +64,18 @@ def main(cfg) -> None:
         cluster, name=cfg.env.group_name, placement_strategy=env_placement
     )
 
+    demo_buffer = None
+    if cfg.get("data", None):
+        from rlinf.data.datasets import create_rl_dataset
+
+        demo_buffer, _ = create_rl_dataset(cfg, tokenizer=None)
+
     runner = EmbodiedRunner(
         cfg=cfg,
         actor=actor_group,
         rollout=rollout_group,
         env=env_group,
+        demo_buffer=demo_buffer,
     )
 
     runner.init_workers()

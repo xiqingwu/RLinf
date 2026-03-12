@@ -13,9 +13,7 @@
 # limitations under the License.
 
 from sglang.srt.managers.detokenizer_manager import (
-    DetokenizerManager as _DetokenizerManager,
-)
-from sglang.srt.managers.detokenizer_manager import (
+    BatchTokenIDOut,
     PortArgs,
     ServerArgs,
     configure_logger,
@@ -26,11 +24,9 @@ from sglang.srt.managers.detokenizer_manager import (
     setproctitle,
     signal,
 )
-
-try:
-    from sglang.srt.managers.io_struct import BatchTokenIDOut
-except ImportError:
-    from sglang.srt.managers.io_struct import BatchTokenIDOutput as BatchTokenIDOut
+from sglang.srt.managers.detokenizer_manager import (
+    DetokenizerManager as _DetokenizerManager,
+)
 
 
 class DetokenizerManager(_DetokenizerManager):

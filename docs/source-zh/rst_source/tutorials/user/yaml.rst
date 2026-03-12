@@ -526,12 +526,10 @@ actor
         reduce_dtype: ${actor.model.precision}
         buffer_dtype: ${actor.model.precision}
 
-      amp_autocast:                                
-        enabled: False                    
-        precision: "bf16"                 
-      
-      grad_scaler:
-        enabled: False      
+      amp:
+        enabled: False
+        precision: "bf16"
+        use_grad_scaler: False
 
 **顶层：**
 
@@ -691,15 +689,11 @@ actor
 
 ``actor.fsdp_config.mixed_precision.buffer_dtype``: FSDP1参数，指定缓冲区使用的数据类型
 
-``actor.fsdp_config.amp_autocast.enabled``: FSDP/FSDP2参数，表示是否启用自动混合精度训练
+``actor.fsdp_config.amp.enabled``: FSDP/FSDP2参数，表示是否启用自动混合精度训练
 
-``actor.fsdp_config.amp_autocast.precision``: FSDP/FSDP2参数，表示AMP使用的数值精度
+``actor.fsdp_config.amp.precision``: FSDP/FSDP2参数，表示AMP使用的数值精度
 
-``actor.fsdp_config.grad_scaler.enabled``: FSDP/FSDP2参数，表示是否启用梯度缩放器
-
-``actor.fsdp_config.grad_scaler.init_scale``: FSDP/FSDP2 参数，表示梯度缩放器的初始缩放因子，用于在训练初期放大梯度以防止数值下溢（Underflow）。
-
-``actor.fsdp_config.grad_scaler.growth_interval``: FSDP/FSDP2 参数，表示在不发生梯度溢出的情况下，缩放因子增加所需的连续迭代步数。
+``actor.fsdp_config.amp.use_grad_scaler``: FSDP/FSDP2参数，表示是否启用梯度缩放器
 
 reward
 ~~~~~~~~~~~~~~~
@@ -827,25 +821,25 @@ env
 
 ``env.enable_offload``：启用环境侧的下放以降低内存占用。
 
-``env.train.total_num_envs``：训练用的并行环境总数。
+``env.train.total_num_envs``: Total number of parallel environments for training.
 
-``env.train.auto_reset``：训练时当 episode 终止时自动重置环境。
+``env.train.auto_reset``: Automatically reset environments when episodes terminate for training.
 
-``env.train.ignore_terminations``：训练时忽略 episode 终止（如果启用，episode 仅在达到 ``max_episode_steps`` 时结束）。
+``env.train.ignore_terminations``: Ignore episode terminations during training (if enabled, episode only ends when it reaches the ``max_episode_steps`` for training).
 
-``env.train.use_fixed_reset_state_ids``：使用固定的 reset 状态 ID（false 则随机化）。GRPO 始终为 True，PPO 默认为 False。
+``env.train.use_fixed_reset_state_ids``: Use fixed reset state IDs (false for randomization). Always True for GRPO, default be False for PPO.
 
-``env.train.max_episode_steps``：训练时每个 episode 的最大步数。
+``env.train.max_episode_steps``: Maximum number of steps per episode for training.
 
-``env.eval.total_num_envs``：评估用的并行环境总数。
+``env.eval.total_num_envs``: Total number of parallel environments for evaluation.
 
-``env.eval.auto_reset``：评估时当 episode 终止时自动重置环境。
+``env.eval.auto_reset``: Automatically reset environments when episodes terminate for evaluation.
 
-``env.eval.ignore_terminations``：评估时忽略 episode 终止（如果启用，episode 仅在达到 ``max_episode_steps`` 时结束）。
+``env.eval.ignore_terminations``: Ignore episode terminations during evaluation (if enabled, episode only ends when it reaches the ``max_episode_steps`` for evaluation).
 
-``env.eval.use_fixed_reset_state_ids``：使用固定的 reset 状态 ID（false 则随机化）。GRPO 始终为 True，PPO 默认为 False。
+``env.eval.use_fixed_reset_state_ids``: Use fixed reset state IDs (false for randomization). Always True for GRPO, default be False for PPO.
 
-``env.eval.max_episode_steps``：评估时每个 episode 的最大步数。
+``env.eval.max_episode_steps``: Maximum number of steps per episode for evaluation.
 
 rollout
 ~~~~~~~~~~~~~~~
