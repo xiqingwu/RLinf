@@ -26,7 +26,6 @@ from rlinf.models.embodiment.dreamzero.sft_builder import (
     build_dreamzero_sft_dataloader,
     build_dreamzero_sft_model,
 )
-from rlinf.utils.pytree import register_pytree_dataclasses
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
 
@@ -34,10 +33,11 @@ class FSDPVlaSftWorker(FSDPSftWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
 
+    def _supported_model(self) -> SupportedModel:
+        return SupportedModel(self.cfg.actor.model.model_type)
+
     def model_provider_func(self):
-        if SupportedModel(self.cfg.actor.model.model_type) in [
-            SupportedModel.DREAMZERO_SFT
-        ]:
+        if self._supported_model() == SupportedModel.DREAMZERO_SFT:
             return build_dreamzero_sft_model(self.cfg.actor.model)
         return super().model_provider_func()
 
@@ -81,9 +81,7 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 self.data_iter = iter(self.data_loader)
 
     def _save_dreamzero_artifacts(self, save_path: str):
-        if SupportedModel(self.cfg.actor.model.model_type) not in [
-            SupportedModel.DREAMZERO_SFT
-        ]:
+        if self._supported_model() != SupportedModel.DREAMZERO_SFT:
             return
         if not isinstance(getattr(self, "data_config", None), dict):
             return
@@ -120,7 +118,9 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         self._load_data_state(load_path)
 
     def build_dataloader(self, data_paths: list[str], eval_dataset: bool = False):
-        if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
+        model_type = self._supported_model()
+
+        if model_type == SupportedModel.OPENPI:
             import openpi.training.data_loader as openpi_data_loader
 
             from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
@@ -135,9 +135,7 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 config, framework="pytorch", shuffle=True
             )
             return data_loader, data_loader.data_config()
-        elif SupportedModel(self.cfg.actor.model.model_type) in [
-            SupportedModel.LINGBOTVLA
-        ]:
+        if model_type == SupportedModel.LINGBOTVLA:
             from rlinf.models.embodiment.lingbotvla.sft_builder import (
                 build_lingbot_sft_dataloader,
             )
@@ -145,66 +143,45 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             return build_lingbot_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths
             )
-        elif SupportedModel(self.cfg.actor.model.model_type) in [
-            SupportedModel.DREAMZERO_SFT
-        ]:
+        if model_type == SupportedModel.DREAMZERO_SFT:
             return build_dreamzero_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
-        else:
-            raise KeyError(
-                f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
-            )
+        raise KeyError(
+            f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
+        )
 
     def get_eval_model_output(self, batch: dict[str, Any]):
         # now the eval is not supported for embodied sft
         raise NotImplementedError("eval is not supported for embodied sft right now.")
 
+    def _move_batch_to_device(self, batch):
+        """Move tensor leaves onto the current device without extra clone/contiguous."""
+        return _pytree.tree_map(
+            lambda x: x.to(device=self.device, non_blocking=True)
+            if isinstance(x, torch.Tensor)
+            else x,
+            batch,
+        )
+
     def get_train_model_output(self, batch: dict[str, Any]):
-        if SupportedModel(self.cfg.actor.model.model_type) in [
-            SupportedModel.LINGBOTVLA
-        ]:
-            batch_data = batch
-            batch_data = _pytree.tree_map(
-                lambda x: torch.as_tensor(x, device=self.device).contiguous().clone()
-                if isinstance(x, torch.Tensor)
-                else x,
-                batch_data,
-            )
+        model_type = self._supported_model()
+        batch_data = self._move_batch_to_device(batch)
+
+        if model_type == SupportedModel.LINGBOTVLA:
             with self.amp_context:
                 losses_dict = self.model(forward_type=ForwardType.SFT, data=batch_data)
             return losses_dict["loss"]
-            
-        elif SupportedModel(self.cfg.actor.model.model_type) in [
-            SupportedModel.DREAMZERO_SFT
-        ]:
-            batch_data = batch
-            batch_data = _pytree.tree_map(
-                lambda x: torch.as_tensor(x, device=self.device).contiguous().clone()
-                if isinstance(x, torch.Tensor)
-                else x,
-                batch_data,
-            )
+
+        if model_type == SupportedModel.DREAMZERO_SFT:
             with self.amp_context:
                 losses_dict = self.model(batch_data)
-            return losses_dict["loss"]
+            return {
+                "loss": losses_dict["loss"],
+                "dynamics_loss": losses_dict["dynamics_loss"],
+                "action_loss": losses_dict["action_loss"],
+            }
 
-        observation, actions = next(self.data_iter)
-        register_pytree_dataclasses(observation)
-        observation = _pytree.tree_map(
-            lambda x: torch.as_tensor(x, device=self.device).contiguous().clone()
-            if x is not None
-            else x,
-            observation,
+        raise NotImplementedError(
+            f"Unsupported model type {self.cfg.actor.model.model_type} for SFT training."
         )
-        actions = actions.to(torch.float32)
-        actions = actions.to(self.device)
-
-        with self.amp_context:
-            losses = self.model(
-                forward_type=ForwardType.SFT,
-                data={"observation": observation, "actions": actions},
-            )
-
-        # train model return the loss
-        return losses

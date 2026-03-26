@@ -103,6 +103,26 @@ class FSDPSftWorker(FSDPModelManager, Worker):
             return model
         return super().model_provider_func()
 
+    @staticmethod
+    def _split_loss_output(loss_output: Any) -> tuple[torch.Tensor, dict[str, float | int]]:
+        metrics: dict[str, float | int] = {}
+        losses = loss_output
+
+        if isinstance(losses, dict):
+            metrics = {
+                key: value.item() if isinstance(value, torch.Tensor) else value
+                for key, value in losses.items()
+                if key != "loss"
+            }
+            losses = losses["loss"]
+
+        if isinstance(losses, (list, tuple)):
+            losses = torch.stack(losses)
+        elif not isinstance(losses, torch.Tensor):
+            losses = torch.tensor(losses, dtype=torch.float32)
+
+        return losses, metrics
+
     def set_global_step(self, global_step):
         self.global_step = global_step
         if hasattr(self.model, "set_global_step"):
@@ -167,20 +187,20 @@ class FSDPSftWorker(FSDPModelManager, Worker):
                     batch = next(self.data_iter)
                     self._data_iter_offset = 1
 
-                losses = self.get_train_model_output(batch)
-
-                if isinstance(losses, (list, tuple)):
-                    losses = torch.stack(losses)
-                elif not isinstance(losses, torch.Tensor):
-                    losses = torch.tensor(
-                        losses, device=self.device, dtype=torch.float32
-                    )
+                losses, sub_metrics = self._split_loss_output(
+                    self.get_train_model_output(batch)
+                )
+                if losses.device != self.device:
+                    losses = losses.to(device=self.device)
                 loss = losses.mean()
 
                 loss = loss / self.gradient_accumulation
                 avg_loss += loss.item()
                 with backward_ctx:
                     self.grad_scaler.scale(loss).backward()
+
+                if sub_metrics:
+                    append_to_dict(metrics, sub_metrics)
 
             # in one step do the optimizer step
             grad_norm, lr_list = self.optimizer_step()
