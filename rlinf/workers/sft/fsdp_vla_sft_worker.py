@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from typing import Any
 
 import torch
@@ -26,6 +27,9 @@ from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 class FSDPVlaSftWorker(FSDPSftWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
+        self._is_dreamzero = (
+            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.DREAMZERO
+        )
 
     def build_dataloader(self, data_paths: list[str], eval_dataset: bool = False):
         if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
@@ -53,6 +57,16 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             return build_lingbot_sft_dataloader(
                 self.cfg, self._world_size, self._rank, data_paths
             )
+        elif SupportedModel(self.cfg.actor.model.model_type) in [
+            SupportedModel.DREAMZERO
+        ]:
+            from rlinf.models.embodiment.dreamzero.sft_data import (
+                build_dreamzero_sft_dataloader,
+            )
+
+            return build_dreamzero_sft_dataloader(
+                self.cfg, self._world_size, self._rank, data_paths, eval_dataset
+            )
         else:
             raise KeyError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
@@ -78,6 +92,23 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             with self.amp_context:
                 losses_dict = self.model(forward_type=ForwardType.SFT, data=batch_data)
             return losses_dict["loss"]
+        if self._is_dreamzero:
+            batch_data = _pytree.tree_map(
+                lambda x: x.to(self.device, non_blocking=True)
+                if isinstance(x, torch.Tensor)
+                else x,
+                batch,
+            )
+            with self.amp_context:
+                losses = self.model(forward_type=ForwardType.SFT, data=batch_data)
+            # Cache sub-loss terms for logging; return only the scalar loss
+            # so the base-class run_training() sees a plain Tensor.
+            self._dreamzero_extra_losses = {
+                k: v.detach().item() if isinstance(v, torch.Tensor) else float(v)
+                for k, v in losses.items()
+                if k != "loss"
+            }
+            return losses["loss"]
         observation, actions = next(self.data_iter)
 
         register_pytree_dataclasses(observation)
@@ -100,3 +131,12 @@ class FSDPVlaSftWorker(FSDPSftWorker):
 
         # train model return the loss
         return losses
+
+    def run_training(self):
+        # DreamZero: append sub-loss metrics (dynamics_loss, action_loss) after
+        # the base-class training step so they appear in wandb logs.
+        train_metrics = super().run_training()
+        if self._is_dreamzero and hasattr(self, "_dreamzero_extra_losses"):
+            train_metrics.update(self._dreamzero_extra_losses)
+            del self._dreamzero_extra_losses
+        return train_metrics

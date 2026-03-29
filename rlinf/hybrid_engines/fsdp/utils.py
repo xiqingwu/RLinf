@@ -163,6 +163,20 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
         )
         policies.append(prismatic_fsdp_wrapping_policy)
 
+    if SupportedModel(model_type) == SupportedModel.DREAMZERO:
+        from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
+
+        def _dreamzero_wrap_fn(mod):
+            cls_name = type(mod).__name__
+            if cls_name in ("WanAttentionBlock", "GanAttentionBlock",
+                            "CausalWanAttentionBlock", "DiTBlock"):
+                return True
+            return False
+
+        policies.append(
+            functools.partial(lambda_auto_wrap_policy, lambda_fn=_dreamzero_wrap_fn)
+        )
+
     if (
         SupportedModel(model_type) == SupportedModel.CNN_POLICY
         and not config.use_orig_params
@@ -204,24 +218,27 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
             )
         policies.append(q_head_policy)
 
-    # Add transformer layer policies
+    # Add transformer layer policies (skip for models with dedicated wrap policies)
     if fsdp_transformer_layer_cls_to_wrap is not None:
         transformer_cls_to_wrap = set()
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
             transformer_cls = get_module_class_from_name(module, layer_class)
-            if transformer_cls is None:
-                raise Exception(
-                    "Could not find the transformer layer class to wrap in the model."
-                )
-            else:
+            if transformer_cls is not None:
                 transformer_cls_to_wrap.add(transformer_cls)
 
-        llm_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            # Transformer layer class to wrap
-            transformer_layer_cls=transformer_cls_to_wrap,
-        )
-        policies.append(llm_wrap_policy)
+        if transformer_cls_to_wrap:
+            llm_wrap_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls=transformer_cls_to_wrap,
+            )
+            policies.append(llm_wrap_policy)
+        elif not any(
+            SupportedModel(model_type) == m
+            for m in (SupportedModel.DREAMZERO,)
+        ):
+            raise Exception(
+                "Could not find the transformer layer class to wrap in the model."
+            )
 
     if hasattr(module, "_no_split_names"):
         no_split_names = getattr(module, "_no_split_names", None)
