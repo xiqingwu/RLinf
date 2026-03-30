@@ -52,6 +52,9 @@ actor:
     dreamzero_num_chunks: 4
     dreamzero_max_action_dim: 32
     dreamzero_max_state_dim: 64
+    cfg_mode: false
+    advantage_parquet: ${oc.env:CFG_ADVANTAGE_PARQUET,advantages_test.parquet}
+    unconditional_prob: ${oc.env:CFG_UNCONDITIONAL_PROB,0.3}
     add_value_head: false
     is_lora: false
 

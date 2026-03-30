@@ -38,6 +38,8 @@ LIBERO_PROMPT_TEMPLATE = (
     "the exterior camera and the right view shows the wrist camera. "
     "The robot {task}"
 )
+POSITIVE_GUIDANCE_PROMPT_TEMPLATE = "[POSITIVE][POSITIVE]\nTask: {task}"
+NEGATIVE_GUIDANCE_PROMPT_TEMPLATE = "[NEGATIVE][NEGATIVE]\nTask: {task}"
 
 
 def _load_gear_stats(meta_dir: Path) -> dict[str, np.ndarray]:
@@ -128,6 +130,9 @@ class DreamZeroLiberoDataset(Dataset):
         num_chunks: int = 4,        # Number of temporal chunks (matches dreamzero_num_chunks in config)
         max_action_dim: int = 32,   # Padding target for action dim (LIBERO uses 7, padded to 32)
         max_state_dim: int = 64,    # Padding target for state dim  (LIBERO uses 8, padded to 64)
+        cfg_mode: bool = False,
+        advantage_parquet: str | None = None,
+        unconditional_prob: float = 0.3,
     ):
         if isinstance(data_path, (list, tuple)):
             if len(data_path) == 0:
@@ -143,6 +148,13 @@ class DreamZeroLiberoDataset(Dataset):
         self.state_horizon = num_chunks   # 4
         self.max_action_dim = max_action_dim
         self.max_state_dim = max_state_dim
+        self.cfg_mode = bool(cfg_mode)
+        self.advantage_parquet = advantage_parquet
+        self.unconditional_prob = float(unconditional_prob)
+        if not 0.0 <= self.unconditional_prob <= 1.0:
+            raise ValueError(
+                f"unconditional_prob must be in [0, 1], got {self.unconditional_prob}"
+            )
         # Embodiment ID 21 is the LIBERO robot; selects per-robot weight matrices in the model
         self.embodiment_id = 21
 
@@ -179,6 +191,60 @@ class DreamZeroLiberoDataset(Dataset):
             self._init_v2()
         else:
             self._init_v3()
+
+        self._advantage_map: dict[int, np.ndarray] = {}
+        self._advantage_path: Path | None = None
+        self._init_advantage_lookup(meta_dir)
+
+    def _init_advantage_lookup(self, meta_dir: Path) -> None:
+        """Load per-frame advantage labels for CFG prompt guidance."""
+        if not self.cfg_mode:
+            return
+
+        import pandas as pd
+
+        adv_path = (
+            Path(self.advantage_parquet)
+            if self.advantage_parquet
+            else (meta_dir / "advantages_test.parquet")
+        )
+        if not adv_path.is_absolute():
+            adv_path = meta_dir / adv_path
+        if not adv_path.exists():
+            raise FileNotFoundError(
+                f"CFG mode enabled but advantage parquet not found: {adv_path}"
+            )
+
+        df = pd.read_parquet(
+            adv_path, columns=["episode_index", "frame_index", "advantage"]
+        )
+        required_cols = {"episode_index", "frame_index", "advantage"}
+        if not required_cols.issubset(df.columns):
+            raise ValueError(
+                f"Advantage parquet must contain columns {sorted(required_cols)}, "
+                f"got {list(df.columns)}"
+            )
+
+        for ep_idx, ep_df in df.groupby("episode_index", sort=False):
+            frame_idx = ep_df["frame_index"].to_numpy(dtype=np.int64)
+            advantage = ep_df["advantage"].to_numpy(dtype=np.bool_)
+            max_frame = int(frame_idx.max())
+            lookup = np.zeros(max_frame + 1, dtype=np.bool_)
+            lookup[frame_idx] = advantage
+            self._advantage_map[int(ep_idx)] = lookup
+
+        self._advantage_path = adv_path
+
+    def _lookup_advantage(self, episode_index: int, frame_index: int) -> bool:
+        """Return per-frame advantage label, clamping to valid range if needed."""
+        if episode_index not in self._advantage_map:
+            raise KeyError(
+                f"episode_index={episode_index} not found in advantage parquet "
+                f"{self._advantage_path}"
+            )
+        values = self._advantage_map[episode_index]
+        idx = min(max(int(frame_index), 0), len(values) - 1)
+        return bool(values[idx])
 
     def _init_v3(self):
         """Initialize with LeRobot v3 dataset (mp4 videos).
@@ -332,6 +398,8 @@ class DreamZeroLiberoDataset(Dataset):
             "observation.state": state,
             "action": action,
             "task_index": task_idx,
+            "episode_index": int(ep_idx),
+            "frame_index": int(frame_in_ep),
         }
 
     @staticmethod
@@ -570,12 +638,31 @@ class DreamZeroLiberoDataset(Dataset):
         action_mask = np.zeros((self.action_horizon, self.max_action_dim), dtype=bool)
         action_mask[:, :action_dim] = True  # mark real dims
 
-        # Resolve task instruction string
-        prompt = sample.get("task")
-        if prompt is None:
+        # Resolve task instruction string.
+        task_text = sample.get("task")
+        if task_text is None:
             task_idx = int(sample.get("task_index", 0))
-            prompt = self._tasks.get(task_idx, "")
-        prompt = str(prompt)
+            task_text = self._tasks.get(task_idx, "")
+        task_text = str(task_text)
+
+        prompt = task_text
+        if self.cfg_mode:
+            episode_index = sample.get("episode_index")
+            frame_index = sample.get("frame_index")
+            if episode_index is None or frame_index is None:
+                raise KeyError(
+                    "CFG mode requires episode_index and frame_index in each sample "
+                    "to lookup per-frame advantage labels."
+                )
+            use_unconditional = np.random.random() < self.unconditional_prob
+            if use_unconditional:
+                prompt = LIBERO_PROMPT_TEMPLATE.format(task=task_text)
+            else:
+                advantage = self._lookup_advantage(int(episode_index), int(frame_index))
+                if advantage:
+                    prompt = POSITIVE_GUIDANCE_PROMPT_TEMPLATE.format(task=task_text)
+                else:
+                    prompt = NEGATIVE_GUIDANCE_PROMPT_TEMPLATE.format(task=task_text)
 
         return {
             # Core training fields
@@ -616,7 +703,7 @@ class DreamZeroCollator:
       text_attention_mask (B, 512)            int64   1 for real tokens, 0 for padding
     """
 
-    def __init__(self, tokenizer_path: str, max_seq_len: int):
+    def __init__(self, tokenizer_path: str, max_seq_len: int, cfg_mode: bool = False):
         from groot.vla.model.dreamzero.transform.dreamzero_cotrain import HuggingfaceTokenizer
 
         # HuggingfaceTokenizer wraps the umt5-xxl tokenizer with fixed output length (512)
@@ -625,6 +712,7 @@ class DreamZeroCollator:
             seq_len=max_seq_len,     # output token IDs are padded/truncated to this length
             clean="whitespace",
         )
+        self.cfg_mode = bool(cfg_mode)
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         batch: dict[str, Any] = {}
@@ -639,11 +727,16 @@ class DreamZeroCollator:
             values = [f[key] for f in features]
             batch[key] = torch.as_tensor(np.stack(values, axis=0))
 
-        # Tokenize text: raw task string -> LIBERO_PROMPT_TEMPLATE -> T5 tokens
+        # Tokenize text:
+        # - SFT mode: raw task string -> LIBERO_PROMPT_TEMPLATE -> T5 tokens
+        # - CFG mode: dataset already outputs final prompt string -> T5 tokens
         # text_ids shape: (B, 512) int32
         # text_mask shape: (B, 512) int32  (1=real token, 0=padding)
         raw_texts = [str(f["text"]) for f in features]
-        text_values = [LIBERO_PROMPT_TEMPLATE.format(task=t) for t in raw_texts]
+        if self.cfg_mode:
+            text_values = raw_texts
+        else:
+            text_values = [LIBERO_PROMPT_TEMPLATE.format(task=t) for t in raw_texts]
         text_ids, text_mask = self.tokenizer(
             text_values, return_mask=True, add_special_tokens=True
         )
@@ -674,6 +767,11 @@ def build_dreamzero_sft_dataloader(
     effective_action_horizon = action_chunk_size * num_chunks  # = 64 total action steps
     max_action_dim = int(model_cfg.get("dreamzero_max_action_dim", 32))
     max_state_dim = int(model_cfg.get("dreamzero_max_state_dim", 64))
+    cfg_mode = bool(model_cfg.get("cfg_mode", False))
+    advantage_parquet = model_cfg.get("advantage_parquet", None)
+    if advantage_parquet in ("", None):
+        advantage_parquet = None
+    unconditional_prob = float(model_cfg.get("unconditional_prob", 0.3))
 
     dataset = DreamZeroLiberoDataset(
         data_path=data_paths,
@@ -681,6 +779,9 @@ def build_dreamzero_sft_dataloader(
         num_chunks=num_chunks,
         max_action_dim=max_action_dim,
         max_state_dim=max_state_dim,
+        cfg_mode=cfg_mode,
+        advantage_parquet=advantage_parquet,
+        unconditional_prob=unconditional_prob,
     )
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset,
@@ -702,6 +803,7 @@ def build_dreamzero_sft_dataloader(
         collate_fn=DreamZeroCollator(
             tokenizer_path=tokenizer_path,
             max_seq_len=max_seq_len,
+            cfg_mode=cfg_mode,
         ),
     )
     return data_loader, {"num_samples": len(dataset)}
