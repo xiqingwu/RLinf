@@ -196,10 +196,22 @@ class DreamZeroLiberoDataset(Dataset):
         self._advantage_path: Path | None = None
         self._init_advantage_lookup(meta_dir)
 
+    # Shared cache across all Dataset instances in the same process to avoid
+    # redundant parquet reads when DataLoader forks worker subprocesses.
+    _advantage_cache: dict[str, dict[int, np.ndarray]] = {}
+
     def _init_advantage_lookup(self, meta_dir: Path) -> None:
-        """Load per-frame advantage labels for CFG prompt guidance."""
+        """Load per-frame advantage labels for CFG prompt guidance.
+
+        Uses a class-level cache keyed by the resolved parquet path so that
+        multiple Dataset instances (e.g. from DataLoader worker forks) share
+        the same parsed numpy arrays via copy-on-write memory.
+        """
         if not self.cfg_mode:
             return
+
+        import logging
+        import time
 
         import pandas as pd
 
@@ -215,6 +227,13 @@ class DreamZeroLiberoDataset(Dataset):
                 f"CFG mode enabled but advantage parquet not found: {adv_path}"
             )
 
+        cache_key = str(adv_path.resolve())
+        if cache_key in DreamZeroLiberoDataset._advantage_cache:
+            self._advantage_map = DreamZeroLiberoDataset._advantage_cache[cache_key]
+            self._advantage_path = adv_path
+            return
+
+        t0 = time.monotonic()
         df = pd.read_parquet(
             adv_path, columns=["episode_index", "frame_index", "advantage"]
         )
@@ -225,26 +244,46 @@ class DreamZeroLiberoDataset(Dataset):
                 f"got {list(df.columns)}"
             )
 
+        advantage_map: dict[int, np.ndarray] = {}
         for ep_idx, ep_df in df.groupby("episode_index", sort=False):
             frame_idx = ep_df["frame_index"].to_numpy(dtype=np.int64)
             advantage = ep_df["advantage"].to_numpy(dtype=np.bool_)
             max_frame = int(frame_idx.max())
             lookup = np.zeros(max_frame + 1, dtype=np.bool_)
             lookup[frame_idx] = advantage
-            self._advantage_map[int(ep_idx)] = lookup
+            advantage_map[int(ep_idx)] = lookup
 
+        DreamZeroLiberoDataset._advantage_cache[cache_key] = advantage_map
+        self._advantage_map = advantage_map
         self._advantage_path = adv_path
+        elapsed = time.monotonic() - t0
+        logging.info(
+            f"Loaded advantage parquet ({len(df)} rows, "
+            f"{len(advantage_map)} episodes) from {adv_path} in {elapsed:.1f}s"
+        )
 
     def _lookup_advantage(self, episode_index: int, frame_index: int) -> bool:
-        """Return per-frame advantage label, clamping to valid range if needed."""
+        """Return per-frame advantage label.
+
+        Raises KeyError if the episode is missing entirely.
+        Logs a warning (once per episode) and clamps if frame_index is out of range.
+        """
         if episode_index not in self._advantage_map:
             raise KeyError(
                 f"episode_index={episode_index} not found in advantage parquet "
                 f"{self._advantage_path}"
             )
         values = self._advantage_map[episode_index]
-        idx = min(max(int(frame_index), 0), len(values) - 1)
-        return bool(values[idx])
+        fi = int(frame_index)
+        if fi < 0 or fi >= len(values):
+            import logging
+
+            logging.warning(
+                f"frame_index={fi} out of range [0, {len(values) - 1}] for "
+                f"episode {episode_index}; clamping to boundary"
+            )
+            fi = min(max(fi, 0), len(values) - 1)
+        return bool(values[fi])
 
     def _init_v3(self):
         """Initialize with LeRobot v3 dataset (mp4 videos).
