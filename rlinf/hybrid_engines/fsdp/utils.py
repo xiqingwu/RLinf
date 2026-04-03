@@ -169,7 +169,9 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
         def _dreamzero_wrap_fn(mod):
             cls_name = type(mod).__name__
             if cls_name in ("WanAttentionBlock", "GanAttentionBlock",
-                            "CausalWanAttentionBlock", "DiTBlock"):
+                            "CausalWanAttentionBlock", "DiTBlock",
+                            "WanTextEncoder",
+                            ):
                 return True
             return False
 

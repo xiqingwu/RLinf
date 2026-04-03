@@ -563,7 +563,8 @@ class WANPolicyHead(ActionHead):
 
     def encode_prompt(self, input_ids, attention_mask):
         seq_lens = attention_mask.gt(0).sum(dim=1).long()
-        prompt_emb = self.text_encoder(input_ids, attention_mask)
+        with torch.no_grad():
+            prompt_emb = self.text_encoder(input_ids, attention_mask)
         prompt_emb = prompt_emb.clone().to(dtype=torch.bfloat16)
         for i, v in enumerate(seq_lens):
             prompt_emb[:, v:] = 0
@@ -578,6 +579,9 @@ class WANPolicyHead(ActionHead):
 
     def encode_video(self, input_video, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
         self._ensure_vae_on_device(input_video)
+        vae_dtype = next(iter(self.vae.parameters())).dtype
+        if input_video.dtype != vae_dtype:
+            input_video = input_video.to(dtype=vae_dtype)
         with torch.no_grad():
             latents = self.vae.encode(input_video, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return latents
@@ -585,7 +589,8 @@ class WANPolicyHead(ActionHead):
     def encode_image(self, image, num_frames, height, width):
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             batch_size = image.shape[0]
-            clip_context = self.image_encoder.encode_image(image)
+            with torch.no_grad():
+                clip_context = self.image_encoder.encode_image(image)
             image_input = image.transpose(1, 2)
             image_zeros = torch.zeros(batch_size, 3, num_frames-1, height, width, dtype=torch.bfloat16, device=self._device)
             self._ensure_vae_on_device(image_input)

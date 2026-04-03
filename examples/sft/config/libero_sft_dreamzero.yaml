@@ -12,7 +12,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0-7
+    actor,env,rollout: all
 
 runner:
   task_type: sft
@@ -29,7 +29,7 @@ runner:
   log_interval: 10
 
 data:
-  train_data_paths: ${oc.env:LIBERO_DATA_PATH,/path/to/libero_10}
+  train_data_paths: ${oc.env:LIBERO_DATA_PATH,/mnt/project_rlinf_hs/yuanhuining/datasets/libero}
 
 algorithm:
   adv_type: gae
@@ -37,26 +37,30 @@ algorithm:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 2
-  global_batch_size: 16
+  micro_batch_size: 1
+  global_batch_size: 4
   seed: 42
   dataloader_num_workers: 4
 
   model:
     model_type: "dreamzero"
     precision: bf16
-    model_path: ${oc.env:DREAMZERO_MODEL_PATH,/path/to/DreamZero-LIBERO}
+    model_path: ${oc.env:DREAMZERO_MODEL_PATH,/mnt/project_rlinf/hf_models/DreamZero-AgiBot}
     tokenizer_path: ${oc.env:UMT5_TOKENIZER_PATH,google/umt5-xxl}
     max_seq_len: 512
+    # DreamZero-LIBERO: action_horizon=16, num_chunks=4 => 64 actions, frame_seqlen=512
     dreamzero_action_horizon: 16
     dreamzero_num_chunks: 4
     dreamzero_max_action_dim: 32
     dreamzero_max_state_dim: 64
+    action_dim: 7
+    embodiment_tag: "libero_sim"
+    cpu_init: true
     cfg_mode: false
     advantage_parquet: ${oc.env:CFG_ADVANTAGE_PARQUET,advantages_test.parquet}
     unconditional_prob: ${oc.env:CFG_UNCONDITIONAL_PROB,0.3}
     add_value_head: false
-    is_lora: false
+    is_lora: true
 
   optim:
     lr: 1.0e-5
